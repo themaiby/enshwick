@@ -146,6 +146,27 @@ type MainEntryFn = unsafe extern "system" fn(menu: usize, entry: *const u8) -> u
 type PauseEntryFn =
     unsafe extern "system" fn(text: *const UiText, enabled: u8, attention: u8) -> u8;
 type ActionNewFn = unsafe extern "system" fn(spec: *mut u8, action: u8, flag: u8) -> *mut u8;
+type PersistFn = unsafe extern "system" fn(
+    node: usize,
+    hash: u64,
+    size: u64,
+    construct: usize,
+    count: u32,
+) -> *mut u8;
+type FirstUseFn = unsafe extern "system" fn(state: *mut u8) -> u8;
+type InitFn = unsafe extern "system" fn(object: Ptr) -> Ptr;
+type ScrollBeginFn = unsafe extern "system" fn(
+    scroll: Ptr,
+    vertical: u8,
+    state: *mut u8,
+    unused: usize,
+    config: *const u8,
+) -> Ptr;
+type ScrollFocusFn = unsafe extern "system" fn(scroll: Ptr) -> f32;
+type ScrollSetFocusFn = unsafe extern "system" fn(scroll: Ptr, focus: f32);
+type ScrollNavFn = unsafe extern "system" fn(scroll: Ptr, config: *const u8);
+type ScrollInputFn = unsafe extern "system" fn(scroll: Ptr, input: *const [u64; 2]);
+type ColumnFn = unsafe extern "system" fn(column: Ptr, gap: f32) -> Ptr;
 type ActionQueryFn = unsafe extern "system" fn(spec: *const u8, out: *mut u8, modality: u16) -> u8;
 type PanelFn = unsafe extern "system" fn(frame: Ptr, config: *const u8);
 type NavInitFn = unsafe extern "system" fn(nav: Ptr, config: *const u8) -> Ptr;
@@ -249,6 +270,27 @@ impl HudWindow {
     }
 }
 
+/// A scroll area's own objects, kept in place from its start to its end:
+/// the sized frame around it, the scroll and the column inside.
+pub(super) struct Scroll {
+    parent: Buf<0x40>,
+    area: Buf<0x600>,
+    column: Buf<0x40>,
+}
+
+impl Scroll {
+    pub(super) const fn new() -> Self {
+        Self {
+            parent: Buf::zeroed(),
+            area: Buf::zeroed(),
+            column: Buf::zeroed(),
+        }
+    }
+}
+
+/// Our key for a scroll area's kept offset among the game's frame states.
+const SCROLL_STATE: u64 = 0x656e_7368_7769_636b;
+
 /// Where the looks the loader uses sit in the look bundle, from reflection.
 #[derive(Debug, Clone, Copy)]
 struct Looks {
@@ -261,6 +303,10 @@ struct Looks {
     sounds: [usize; 4],
     setting_off: usize,
     setting_on: usize,
+    scrollbar_slider: usize,
+    scrollbar_range: usize,
+    scrollbar_tint: usize,
+    highlight_sound: usize,
 }
 
 /// The engine functions and looks, resolved for the running build.
@@ -310,11 +356,35 @@ pub(crate) struct Engine {
     pub(super) main_menu_site: u64,
     pub(super) pause_menu_site: u64,
     pub(super) world_settings_site: u64,
+    persist: PersistFn,
+    first_use: FirstUseFn,
+    scroll_config: InitFn,
+    scrollbar_look: InitFn,
+    scroll_begin: ScrollBeginFn,
+    scroll_focus: ScrollFocusFn,
+    scroll_set_focus: ScrollSetFocusFn,
+    scroll_nav: ScrollNavFn,
+    scroll_input: ScrollInputFn,
+    scroll_end: OneFn,
+    column: ColumnFn,
+    no_construct: usize,
 }
 
 /// Every function the loader calls or hooks, by symbol; each must read its
 /// `<symbol>.bytes` constant.
-const FUNCTIONS: [&str; 43] = [
+const FUNCTIONS: [&str; 55] = [
+    "ui.persist",
+    "ui.first_use",
+    "ui.scroll_config",
+    "ui.scrollbar_look",
+    "ui.scroll_begin",
+    "ui.scroll_focus",
+    "ui.scroll_set_focus",
+    "ui.scroll_nav",
+    "ui.scroll_input",
+    "ui.scroll_end",
+    "ui.column",
+    "ui.no_construct",
     "ui.world_settings_site",
     "ui.main_entry",
     "ui.pause_entry",
@@ -396,6 +466,17 @@ fn setting_text(loader: &Loader, name: &str) -> Option<usize> {
     )
 }
 
+fn scrollbar(loader: &Loader, name: &str) -> Option<usize> {
+    path(
+        loader,
+        &[
+            (BUNDLE, "menu"),
+            ("keen::FbUiMenu", "scrollbar"),
+            ("keen::FbUiMenuScrollbar", name),
+        ],
+    )
+}
+
 fn looks(loader: &Loader) -> Option<Looks> {
     Some(Looks {
         styles: [
@@ -427,6 +508,10 @@ fn looks(loader: &Loader) -> Option<Looks> {
             sound(loader, "back")?,
             sound(loader, "entryTriggerFailed")?,
         ],
+        scrollbar_slider: scrollbar(loader, "slider")?,
+        scrollbar_range: scrollbar(loader, "range")?,
+        scrollbar_tint: scrollbar(loader, "rangeTint")?,
+        highlight_sound: sound(loader, "highlightChange")?,
         setting_off: setting_text(loader, "settingOff")?,
         setting_on: setting_text(loader, "settingOn")?,
     })
@@ -531,6 +616,18 @@ impl Engine {
             main_menu_site: loader.address("ui.main_menu_site").unwrap_or(0),
             pause_menu_site: loader.address("ui.pause_menu_site").unwrap_or(0),
             world_settings_site: loader.address("ui.world_settings_site").unwrap_or(0),
+            persist: function!("ui.persist", PersistFn),
+            first_use: function!("ui.first_use", FirstUseFn),
+            scroll_config: function!("ui.scroll_config", InitFn),
+            scrollbar_look: function!("ui.scrollbar_look", InitFn),
+            scroll_begin: function!("ui.scroll_begin", ScrollBeginFn),
+            scroll_focus: function!("ui.scroll_focus", ScrollFocusFn),
+            scroll_set_focus: function!("ui.scroll_set_focus", ScrollSetFocusFn),
+            scroll_nav: function!("ui.scroll_nav", ScrollNavFn),
+            scroll_input: function!("ui.scroll_input", ScrollInputFn),
+            scroll_end: function!("ui.scroll_end", OneFn),
+            column: function!("ui.column", ColumnFn),
+            no_construct: at("ui.no_construct"),
         })
     }
 
@@ -1050,6 +1147,129 @@ impl Engine {
         spec.u8(0x1b, 1);
         // SAFETY: the spec just built, no details out, the menus' modality.
         unsafe { (self.action_query)(spec.ptr(), core::ptr::null_mut(), 0x10) != 0 }
+    }
+
+    /// Starts a scroll area `height` high and as wide as its parent, as the
+    /// world settings scroll their tabs; widgets that follow go into it,
+    /// `gap` apart, until [`Engine::scroll_end`]. The game keeps the offset.
+    ///
+    /// # Safety
+    ///
+    /// Inside a window, on the frame's thread, with `scroll` kept in place
+    /// until [`Engine::scroll_end`].
+    pub(super) unsafe fn scroll_begin(
+        &self,
+        context: usize,
+        scroll: &mut Scroll,
+        height: f32,
+        gap: f32,
+    ) {
+        let bundle = Self::bundle(context);
+        // SAFETY: an unnamed frame inside the window, to size the area.
+        unsafe { (self.frame_open)(scroll.parent.ptr(), 0) };
+        let parent = scroll.parent.read_usize(8);
+        // SAFETY: the frame's node and its height.
+        unsafe { (self.node_height)(parent, height) };
+        // SAFETY: the frame's node, as wide as the window.
+        unsafe { (self.node_stretch)(parent, stretch(1.0, 0.0)) };
+        // SAFETY: the frame's state store, keyed by its node, 0x18 bytes
+        // built by a constructor that does nothing, as the world settings ask.
+        let state = unsafe { (self.persist)(parent, SCROLL_STATE, 0x18, self.no_construct, 1) };
+        if state.is_null() {
+            return;
+        }
+        // SAFETY: the state just handed out.
+        if unsafe { (self.first_use)(state) } != 0 {
+            // SAFETY: 0x18 bytes of the state, on first use.
+            unsafe { state.write_bytes(0, 0x18) };
+        }
+        let mut config = Buf::<0x110>::zeroed();
+        // SAFETY: the scroll config's constructor fills its defaults.
+        unsafe { (self.scroll_config)(config.ptr()) };
+        let mut look = Buf::<0xc0>::zeroed();
+        // SAFETY: the scrollbar look's constructor fills its defaults.
+        unsafe { (self.scrollbar_look)(look.ptr()) };
+        look.u8(0x7c, 1);
+        let copy32 = |look: &mut Buf<0xc0>, at: usize, from: usize| {
+            for i in 0..4 {
+                // SAFETY: the bundle's nine-slice texture, 32 bytes read.
+                let word = unsafe { crate::world::read::<u64>(bundle, from + 8 * i) };
+                look.u64(at + 8 * i, word);
+            }
+        };
+        copy32(&mut look, 0x44, self.looks.scrollbar_slider);
+        copy32(&mut look, 0x24, self.looks.scrollbar_range);
+        for (at, value) in [(0x80, 24.0f32), (0x84, 24.0), (0x88, 24.0), (0x8c, 20.0)] {
+            look.f32(at, value);
+        }
+        // SAFETY: the bundle's scrollbar tint, a colour.
+        let tint = unsafe { crate::world::read::<u64>(bundle, self.looks.scrollbar_tint) };
+        look.u64(0x04, tint);
+        look.u8(0x90, 1);
+        for i in 0..0x18 {
+            config.u64(0x44 + 8 * i, look.read_u64(8 * i));
+        }
+        config.u8(0x40, config.read_u16(0x40).to_le_bytes()[0] | 0x18);
+        config.u16(0x2e, 0x101);
+        config.u8(0x32, 1);
+        let mut nav = Buf::<0x58>::zeroed();
+        nav.u32(0, 3);
+        nav.u8(0x20, 1);
+        nav.u32(0x24, 3);
+        nav.u16(0x28, 0x101);
+        nav.u32(0x30, 2);
+        nav.u16(0x34, 0x1b);
+        for i in 0..2 {
+            // SAFETY: the bundle's highlight sound, 16 bytes read.
+            let word =
+                unsafe { crate::world::read::<u64>(bundle, self.looks.highlight_sound + 8 * i) };
+            nav.u64(0x38 + 8 * i, word);
+        }
+        nav.u16(0x48, 1);
+        // SAFETY: the scroll object, vertical, its kept state and config.
+        unsafe { (self.scroll_begin)(scroll.area.ptr(), 1, state, 0, config.ptr()) };
+        // SAFETY: the scroll just started.
+        let focus = unsafe { (self.scroll_focus)(scroll.area.ptr()) };
+        // SAFETY: as above.
+        unsafe { (self.scroll_set_focus)(scroll.area.ptr(), focus) };
+        let node = scroll.area.read_usize(8);
+        // SAFETY: the scroll's node, filling the sized frame.
+        unsafe { (self.node_stretch)(node, stretch(1.0, 1.0)) };
+        // SAFETY: the scroll and its navigation config.
+        unsafe { (self.scroll_nav)(scroll.area.ptr(), nav.ptr()) };
+        let mut input = [0u64; 2];
+        // SAFETY: the navigation config, the player's input written out.
+        unsafe { (self.nav_input)(&raw mut input, nav.ptr(), 0) };
+        // SAFETY: the scroll and the input.
+        unsafe { (self.scroll_input)(scroll.area.ptr(), &raw const input) };
+        // SAFETY: a column inside the scroll, `gap` between its rows.
+        unsafe { (self.column)(scroll.column.ptr(), gap) };
+        let column = scroll.column.read_usize(8);
+        // SAFETY: the column's node, as wide as the scroll.
+        unsafe { (self.node_stretch)(column, stretch(1.0, 0.0)) };
+    }
+
+    /// Ends a scroll area started with [`Engine::scroll_begin`].
+    ///
+    /// # Safety
+    ///
+    /// As for [`Engine::scroll_begin`], in the same frame.
+    pub(super) unsafe fn scroll_end(&self, scroll: &mut Scroll) {
+        if scroll.column.read_usize(8) == 0 {
+            // The state store refused: only the sized frame is open.
+            // SAFETY: the frame the start opened.
+            unsafe { (self.frame_close)(scroll.parent.ptr()) };
+            return;
+        }
+        // SAFETY: the column, the scroll and the frame the start opened,
+        // innermost first; the scroll's end keeps the offset and drops its
+        // navigation group.
+        unsafe { (self.frame_close)(scroll.column.ptr()) };
+        // SAFETY: as above.
+        unsafe { (self.scroll_end)(scroll.area.ptr()) };
+        // SAFETY: as above.
+        unsafe { (self.frame_close)(scroll.parent.ptr()) };
+        scroll.column.u64(8, 0);
     }
 
     /// Plays interface sound `sound`.

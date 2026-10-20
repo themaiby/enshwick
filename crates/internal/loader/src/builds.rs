@@ -669,6 +669,18 @@ pub static BUILDS: &[KnownBuild] = &[
             ("ui.main_menu_site", 0xc1_a7e0),
             ("ui.pause_menu_site", 0xcc_1a87),
             ("ui.world_settings_site", 0xb8_32bb),
+            ("ui.persist", 0x118_32f0),
+            ("ui.first_use", 0x119_d3c0),
+            ("ui.scroll_config", 0xa3_09a0),
+            ("ui.scrollbar_look", 0xa2_fa10),
+            ("ui.scroll_begin", 0xa2_fb10),
+            ("ui.scroll_focus", 0xd3_95d0),
+            ("ui.scroll_set_focus", 0xa4_33d0),
+            ("ui.scroll_nav", 0xa3_b280),
+            ("ui.scroll_input", 0xa4_31c0),
+            ("ui.scroll_end", 0xa3_1c50),
+            ("ui.column", 0xa2_e290),
+            ("ui.no_construct", 0xab_cc60),
         ],
         constants: &[
             ("text.pool_language", 0xd8),
@@ -1033,6 +1045,18 @@ pub static BUILDS: &[KnownBuild] = &[
             ("ui.main_menu_site.bytes", 0x0001_4824_44c7_c033),
             ("ui.pause_menu_site.bytes", 0x4c01_b59a_0a05_8b48),
             ("ui.world_settings_site.bytes", 0xe800_0017_588d_8d48),
+            ("ui.persist.bytes", 0x4c89_4c10_245c_8948),
+            ("ui.first_use.bytes", 0xcccc_ccc3_f041_b60f),
+            ("ui.scroll_config.bytes", 0x8d48_5510_245c_8948),
+            ("ui.scrollbar_look.bytes", 0xffff_ffff_0824_44c7),
+            ("ui.scroll_begin.bytes", 0x4154_4157_55c4_8b48),
+            ("ui.scroll_focus.bytes", 0x8148_5710_245c_8948),
+            ("ui.scroll_set_focus.bytes", 0x7500_0000_0468_b980),
+            ("ui.scroll_nav.bytes", 0x8b48_20ec_8348_5340),
+            ("ui.scroll_input.bytes", 0xf00_0000_0190_b980),
+            ("ui.scroll_end.bytes", 0x4157_5653_55c4_8b48),
+            ("ui.column.bytes", 0x8b48_30ec_8348_5340),
+            ("ui.no_construct.bytes", 0xcccc_cccc_cc00_00c2),
         ],
     },
 ];
@@ -1091,7 +1115,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert!(checked >= 42);
+        assert!(checked >= 54);
         let reflection = enshwick_loader_reflect::Reflection::scan(&image);
         for (ty, field, offset) in [
             ("keen::FbUiBundle", "namedStyles", 0x10a0c),

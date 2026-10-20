@@ -26,15 +26,13 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use enshwick_loader_api::abi::{Registers, UiWidget};
 
-use super::engine::{Engine, Window};
+use super::engine::{Engine, Scroll, Window};
 use super::{ENGINE, Painter, copy};
 use crate::configure::rows::{self, Lock, Row, Widget};
 use crate::host::Loader;
 
-/// Mods a list page shows.
-const MODS_PER_PAGE: usize = 4;
-/// Settings a mod's page shows.
-const ROWS_PER_PAGE: usize = 5;
+/// The height of the screen's scroll area.
+const SCROLL_HEIGHT: f32 = 620.0;
 /// The layers of the screen: over the main menu (layer 9) and over the
 /// pause menu (0x1a), as the game's own settings and submenus.
 const OVER_MAIN: u32 = 0x1a;
@@ -68,21 +66,15 @@ const WORLD_SETTINGS_SUBMENU: u32 = 4;
 
 /// What the screen shows.
 enum Page {
-    /// The mods, from `first`.
-    List { first: usize },
-    /// Mod `index`'s settings, from row `first`.
-    Settings {
-        index: usize,
-        first: usize,
-        rows: Vec<Row>,
-    },
-    /// The joined server's mods with settings, from `first`.
-    ServerList { first: usize },
-    /// The joined server's settings of mod `id`, from row `first`, as last
-    /// heard (`news`).
+    /// The mods.
+    List,
+    /// Mod `index`'s settings.
+    Settings { index: usize, rows: Vec<Row> },
+    /// The joined server's mods with settings.
+    ServerList,
+    /// The joined server's settings of mod `id`, as last heard (`news`).
     ServerSettings {
         id: String,
-        first: usize,
         rows: Vec<Row>,
         schema: Option<enshwick_loader_api::config::Schema>,
         news: u64,
@@ -95,6 +87,7 @@ struct Screen {
     /// The last change's outcome, and whether it went through.
     message: Option<(String, bool)>,
     window: Window,
+    scroll: Scroll,
 }
 
 thread_local! {
@@ -226,9 +219,10 @@ pub(super) unsafe fn draw(loader: &Loader, engine: &Engine, context: usize, fram
             };
             *slot = Some(Screen {
                 from: opened,
-                page: Page::List { first: 0 },
+                page: Page::List,
                 message: None,
                 window: Window::screen(layer, GAP),
+                scroll: Scroll::new(),
             });
             BACK.store(0, Ordering::Relaxed);
         }
@@ -273,15 +267,15 @@ pub(super) unsafe fn draw(loader: &Loader, engine: &Engine, context: usize, fram
 fn back(screen: &mut Screen) -> bool {
     screen.message = None;
     match screen.page {
-        Page::Settings { .. } | Page::ServerList { .. } => {
-            screen.page = Page::List { first: 0 };
+        Page::Settings { .. } | Page::ServerList => {
+            screen.page = Page::List;
             false
         }
         Page::ServerSettings { .. } => {
             open_server_list(screen);
             false
         }
-        Page::List { .. } => true,
+        Page::List => true,
     }
 }
 
@@ -294,7 +288,7 @@ fn joined_elsewhere() -> bool {
 fn open_server_list(screen: &mut Screen) {
     crate::remote::forget();
     let asked = crate::net::to_server(&crate::remote::Message::Query { id: String::new() });
-    screen.page = Page::ServerList { first: 0 };
+    screen.page = Page::ServerList;
     screen.message = (!asked).then(|| ("The server takes no messages now.".to_owned(), false));
 }
 
@@ -302,12 +296,12 @@ fn open_server_list(screen: &mut Screen) {
 unsafe fn show(loader: &Loader, engine: &Engine, context: usize, screen: &mut Screen) -> bool {
     let name = copy(&[b"enshwick/loader/mods"]);
     let title = match &screen.page {
-        Page::List { .. } => copy(&[b"Mods"]),
+        Page::List => copy(&[b"Mods"]),
         Page::Settings { index, .. } => loader
             .mods
             .get(*index)
             .map_or_else(|| copy(&[b"Mods"]), |m| copy(&[m.label().as_bytes()])),
-        Page::ServerList { .. } => copy(&[b"Server settings"]),
+        Page::ServerList => copy(&[b"Server settings"]),
         Page::ServerSettings { id, .. } => copy(&[b"Server settings: ", id.as_bytes()]),
     };
     // SAFETY: forwarded from the caller; the window lives in the screen's
@@ -323,79 +317,96 @@ unsafe fn show(loader: &Loader, engine: &Engine, context: usize, screen: &mut Sc
         };
         paint.label(text.as_bytes(), style, true, true);
     }
-    let close = match &mut screen.page {
-        Page::List { first } => {
+    // SAFETY: inside the window; the scroll's objects live in the screen's
+    // state until it ends below, in this frame.
+    unsafe { engine.scroll_begin(context, &mut screen.scroll, SCROLL_HEIGHT, GAP) };
+    let next = content(loader, &paint, &mut screen.page);
+    // SAFETY: the scroll started above.
+    unsafe { engine.scroll_end(&mut screen.scroll) };
+    let back = paint.button(b"Back", true);
+    // SAFETY: the window started above, in this frame.
+    unsafe { engine.window_end(context, &mut screen.window) };
+    match next {
+        Next::Stay => {}
+        Next::ServerList => {
+            open_server_list(screen);
+            return false;
+        }
+        Next::Page(page, message) => {
+            screen.page = page;
+            screen.message = message;
+            return false;
+        }
+        Next::Message(message) => screen.message = Some(message),
+    }
+    back && self::back(screen)
+}
+
+/// What the screen does after a frame of its content.
+enum Next {
+    /// Nothing.
+    Stay,
+    /// Opens the server's list of mods.
+    ServerList,
+    /// Opens a page, with a message or none.
+    Page(Page, Option<(String, bool)>),
+    /// Shows a message.
+    Message((String, bool)),
+}
+
+/// Draws the page's content inside the scroll area.
+fn content(loader: &Loader, paint: &Painter<'_>, page: &mut Page) -> Next {
+    match page {
+        Page::List => {
             if joined_elsewhere() && paint.button(b"Server settings", true) {
-                open_server_list(screen);
-                // SAFETY: the window started above, in this frame.
-                unsafe { engine.window_end(context, &mut screen.window) };
-                return false;
+                return Next::ServerList;
             }
-            let opened = list(loader, &paint, first);
-            if let Some(index) = opened {
-                screen.page = Page::Settings {
-                    index,
-                    first: 0,
-                    rows: page_rows(loader, index),
-                };
-                screen.message = None;
+            match list(loader, paint) {
+                Some(index) => Next::Page(
+                    Page::Settings {
+                        index,
+                        rows: page_rows(loader, index),
+                    },
+                    None,
+                ),
+                None => Next::Stay,
             }
-            paint.button(b"Back", true)
         }
-        Page::Settings { index, first, rows } => {
-            if let Some(message) = settings(loader, &paint, *index, first, rows) {
+        Page::Settings { index, rows } => match settings(loader, paint, *index, rows) {
+            Some(message) => {
                 *rows = page_rows(loader, *index);
-                screen.message = Some(message);
+                Next::Message(message)
             }
-            if paint.button(b"Back", true) {
-                screen.page = Page::List { first: 0 };
-                screen.message = None;
-            }
-            false
-        }
-        Page::ServerList { first } => {
-            if let Some(id) = server_list(&paint, first) {
+            None => Next::Stay,
+        },
+        Page::ServerList => match server_list(paint) {
+            Some(id) => {
                 let asked =
                     crate::net::to_server(&crate::remote::Message::Query { id: id.clone() });
-                screen.message =
-                    (!asked).then(|| ("The server takes no messages now.".to_owned(), false));
-                screen.page = Page::ServerSettings {
-                    id,
-                    first: 0,
-                    rows: Vec::new(),
-                    schema: None,
-                    news: 0,
-                };
-            } else if paint.button(b"Back", true) {
-                screen.page = Page::List { first: 0 };
-                screen.message = None;
+                Next::Page(
+                    Page::ServerSettings {
+                        id,
+                        rows: Vec::new(),
+                        schema: None,
+                        news: 0,
+                    },
+                    (!asked).then(|| ("The server takes no messages now.".to_owned(), false)),
+                )
             }
-            false
-        }
+            None => Next::Stay,
+        },
         Page::ServerSettings {
             id,
-            first,
             rows,
             schema,
             news,
-        } => {
-            if let Some(message) = server_settings(&paint, id, first, rows, schema, news) {
-                screen.message = Some(message);
-            }
-            if paint.button(b"Back", true) {
-                open_server_list(screen);
-            }
-            false
-        }
-    };
-    // SAFETY: the window started above, in this frame.
-    unsafe { engine.window_end(context, &mut screen.window) };
-    close
+        } => server_settings(paint, id, rows, schema, news).map_or(Next::Stay, Next::Message),
+    }
 }
 
-/// Draws a page of the server's mods; the mod whose settings the player
+/// Draws the server's mods; the mod whose settings the player
 /// opened.
-fn server_list(paint: &Painter<'_>, first: &mut usize) -> Option<String> {
+fn server_list(paint: &Painter<'_>) -> Option<String> {
     let mods = crate::remote::heard(|h| h.mods.clone());
     let Some(mods) = mods else {
         paint.label(
@@ -415,23 +426,21 @@ fn server_list(paint: &Painter<'_>, first: &mut usize) -> Option<String> {
         );
     }
     let mut opened = None;
-    for (id, name) in mods.iter().skip(*first).take(MODS_PER_PAGE) {
+    for (id, name) in &mods {
         paint.label(name.as_bytes(), UiWidget::STYLE_H3, false, false);
         if paint.button(b"Settings", true) {
             opened = Some(id.clone());
         }
     }
-    pages(paint, first, mods.len(), MODS_PER_PAGE);
     opened
 }
 
-/// Draws a page of the server's settings of mod `id`, rebuilding the rows
+/// Draws the server's settings of mod `id`, rebuilding the rows
 /// when the server sent news; the outcome of a change or the server's
 /// answer.
 fn server_settings(
     paint: &Painter<'_>,
     id: &str,
-    first: &mut usize,
     rows: &mut Vec<Row>,
     schema: &mut Option<enshwick_loader_api::config::Schema>,
     news: &mut u64,
@@ -471,7 +480,7 @@ fn server_settings(
         return message;
     };
     let mut changed = None;
-    for row in rows.iter().skip(*first).take(ROWS_PER_PAGE) {
+    for row in rows {
         if let Some(value) = draw_row(paint, id, known, row) {
             changed = Some((row.key.clone(), value));
         }
@@ -479,7 +488,6 @@ fn server_settings(
             paint.label(row.doc.as_bytes(), UiWidget::STYLE_SECONDARY, true, false);
         }
     }
-    pages(paint, first, rows.len(), ROWS_PER_PAGE);
     if let Some((key, value)) = changed {
         let sent = crate::net::to_server(&crate::remote::Message::Edit {
             id: id.to_owned(),
@@ -495,8 +503,8 @@ fn server_settings(
     message
 }
 
-/// Draws a page of the mod list; the mod whose settings the player opened.
-fn list(loader: &Loader, paint: &Painter<'_>, first: &mut usize) -> Option<usize> {
+/// Draws the mod list; the mod whose settings the player opened.
+fn list(loader: &Loader, paint: &Painter<'_>) -> Option<usize> {
     let mods = &loader.mods;
     let mut opened = None;
     if crate::world::hosting() && JUMP_SHOWN.load(Ordering::Relaxed) != 0 {
@@ -517,7 +525,7 @@ fn list(loader: &Loader, paint: &Painter<'_>, first: &mut usize) -> Option<usize
             false,
         );
     }
-    for (index, record) in mods.iter().enumerate().skip(*first).take(MODS_PER_PAGE) {
+    for (index, record) in mods.iter().enumerate() {
         let off = if record.off.load(Ordering::Acquire) {
             " (off)"
         } else {
@@ -553,27 +561,7 @@ fn list(loader: &Loader, paint: &Painter<'_>, first: &mut usize) -> Option<usize
             paint.label(note.as_bytes(), UiWidget::STYLE_SECONDARY, false, false);
         }
     }
-    pages(paint, first, mods.len(), MODS_PER_PAGE);
     opened
-}
-
-/// The Previous and Next buttons of a paged list of `count` items.
-fn pages(paint: &Painter<'_>, first: &mut usize, count: usize, per_page: usize) {
-    if count <= per_page {
-        return;
-    }
-    let page = format!(
-        "Page {} of {}",
-        *first / per_page + 1,
-        count.div_ceil(per_page)
-    );
-    paint.label(page.as_bytes(), UiWidget::STYLE_SECONDARY, false, true);
-    if *first + per_page < count && paint.button(b"Next page", true) {
-        *first += per_page;
-    }
-    if *first > 0 && paint.button(b"Previous page", true) {
-        *first = first.saturating_sub(per_page);
-    }
 }
 
 /// The rows of mod `index`'s settings page.
@@ -614,12 +602,11 @@ fn server_table(values: &str) -> Option<toml::Table> {
         .cloned()
 }
 
-/// Draws a page of mod `index`'s settings; the outcome of a change.
+/// Draws mod `index`'s settings; the outcome of a change.
 fn settings(
     loader: &Loader,
     paint: &Painter<'_>,
     index: usize,
-    first: &mut usize,
     rows: &[Row],
 ) -> Option<(String, bool)> {
     let record = loader.mods.get(index)?;
@@ -633,7 +620,7 @@ fn settings(
     }
     let schema = record.schema.lock().ok().and_then(|s| s.clone())?;
     let mut changed = None;
-    for row in rows.iter().skip(*first).take(ROWS_PER_PAGE) {
+    for row in rows {
         if let Some(value) = draw_row(paint, &record.id, &schema, row) {
             changed = Some((row.key.clone(), value));
         }
@@ -641,7 +628,6 @@ fn settings(
             paint.label(row.doc.as_bytes(), UiWidget::STYLE_SECONDARY, true, false);
         }
     }
-    pages(paint, first, rows.len(), ROWS_PER_PAGE);
     let (key, value) = changed?;
     Some(
         match crate::configure::apply(loader, index, &key, &value, "the Mods screen") {
